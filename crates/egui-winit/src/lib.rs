@@ -9,9 +9,14 @@
 
 #![expect(clippy::manual_range_contains)]
 
+use std::collections::HashMap;
 #[cfg(target_os = "windows")]
 use std::collections::HashSet;
 
+#[cfg(feature = "accesskit")]
+compile_error!(
+    "The released AccessKit adapter requires winit 0.30; disable the accesskit feature with this beta."
+);
 #[cfg(feature = "accesskit")]
 pub use accesskit_winit;
 pub use egui;
@@ -20,44 +25,43 @@ use egui::accesskit;
 use egui::{Pos2, Rect, Theme, Vec2, ViewportBuilder, ViewportCommand, ViewportId, ViewportInfo};
 pub use winit;
 
-// TODO(emilk): remove once we are on a winit with https://github.com/rust-windowing/winit/pull/4732
-#[cfg(target_os = "macos")]
-mod macos_scroll_momentum;
-
 pub mod clipboard;
 #[cfg(not(target_arch = "wasm32"))]
 mod dropped_file;
+#[cfg(not(target_arch = "wasm32"))]
+use dropped_file::NativeFile;
 mod safe_area;
 mod window_settings;
+
+#[cfg(test)]
+mod pointer_tests;
 
 pub use window_settings::{WindowGeometry, WindowSettings};
 
 use raw_window_handle::HasDisplayHandle;
 
-#[cfg(not(target_arch = "wasm32"))]
-use dropped_file::NativeFile;
-
 use winit::{
+    cursor::CustomCursor,
     dpi::{PhysicalPosition, PhysicalSize},
     event::ElementState,
     event_loop::ActiveEventLoop,
-    window::{CursorGrabMode, CustomCursor, Window, WindowButtons, WindowLevel},
+    window::{CursorGrabMode, Window, WindowButtons, WindowLevel},
 };
 
-pub fn screen_size_in_pixels(window: &Window) -> egui::Vec2 {
+pub fn screen_size_in_pixels(window: &dyn Window) -> egui::Vec2 {
     let size = if cfg!(target_os = "ios") {
         // `outer_size` Includes the area behind the "dynamic island".
         // It is up to the eframe user to make sure the dynamic island doesn't cover anything important.
         // That will be easier once https://github.com/rust-windowing/winit/pull/3890 lands
         window.outer_size()
     } else {
-        window.inner_size()
+        window.surface_size()
     };
     egui::vec2(size.width as f32, size.height as f32)
 }
 
 /// Calculate the `pixels_per_point` for a given window, given the current egui zoom factor
-pub fn pixels_per_point(egui_ctx: &egui::Context, window: &Window) -> f32 {
+pub fn pixels_per_point(egui_ctx: &egui::Context, window: &dyn Window) -> f32 {
     let native_pixels_per_point = window.scale_factor() as f32;
     let egui_zoom_factor = egui_ctx.zoom_factor();
     egui_zoom_factor * native_pixels_per_point
@@ -123,7 +127,11 @@ pub struct State {
     /// Is Some(…) when a touch is being translated to a pointer.
     ///
     /// Only one touch will be interpreted as pointer at any time.
-    pointer_touch_id: Option<u64>,
+    pointer_touch_id: Option<(Option<winit::event::DeviceId>, winit::event::FingerId)>,
+    pen_down: bool,
+    pending_drops:
+        HashMap<winit::event_loop::AsyncRequestSerial, winit::data_transfer::DataTransferId>,
+    touches: HashMap<(Option<winit::event::DeviceId>, winit::event::FingerId), Pos2>,
 
     #[cfg(feature = "accesskit")]
     pub accesskit: Option<accesskit_winit::Adapter>,
@@ -135,10 +143,6 @@ pub struct State {
 
     ime_cursor_rect_px: Option<egui::Rect>,
     old_ime_purpose: egui::IMEPurpose,
-
-    // TODO(emilk): remove once we are on a winit with https://github.com/rust-windowing/winit/pull/4732
-    #[cfg(target_os = "macos")]
-    scroll_momentum_monitor: Option<macos_scroll_momentum::ScrollMomentumMonitor>,
 
     /// Used by [`State::try_on_ime_processed_keyboard_input`] to track key
     /// release events that should be filtered out. See comments in that method
@@ -189,6 +193,9 @@ impl State {
 
             simulate_touch_screen: false,
             pointer_touch_id: None,
+            pen_down: false,
+            touches: HashMap::new(),
+            pending_drops: HashMap::new(),
 
             #[cfg(feature = "accesskit")]
             accesskit: None,
@@ -197,8 +204,6 @@ impl State {
             clipboard_shortcuts: true,
             ime_cursor_rect_px: None,
             old_ime_purpose: egui::IMEPurpose::Normal,
-            #[cfg(target_os = "macos")]
-            scroll_momentum_monitor: macos_scroll_momentum::ScrollMomentumMonitor::install(),
             #[cfg(target_os = "windows")]
             pressed_processed_physical_keys: HashSet::new(),
         };
@@ -217,11 +222,11 @@ impl State {
     }
 
     #[cfg(feature = "accesskit")]
-    pub fn init_accesskit<T: From<accesskit_winit::Event> + Send>(
+    pub fn init_accesskit(
         &mut self,
-        event_loop: &ActiveEventLoop,
-        window: &Window,
-        event_loop_proxy: winit::event_loop::EventLoopProxy<T>,
+        event_loop: &dyn ActiveEventLoop,
+        window: &dyn Window,
+        event_loop_proxy: winit::event_loop::EventLoopProxy,
     ) {
         profiling::function_scope!();
 
@@ -317,7 +322,7 @@ impl State {
     /// You need to set [`egui::RawInput::viewports`] yourself though.
     /// Use [`update_viewport_info`] to update the info for each
     /// viewport.
-    pub fn take_egui_input(&mut self, window: &Window) -> egui::RawInput {
+    pub fn take_egui_input(&mut self, window: &dyn Window) -> egui::RawInput {
         profiling::function_scope!();
 
         self.egui_input.time = Some(self.start_time.elapsed().as_secs_f64());
@@ -345,12 +350,86 @@ impl State {
         self.egui_input.take()
     }
 
+    /// Handle window events including native file drops.
+    ///
+    /// Winit 0.31 requires the event loop to accept drag operations and fetch their data.
+    pub fn on_window_event_with_event_loop(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+        window: &dyn Window,
+        event: &winit::event::WindowEvent,
+    ) -> EventResponse {
+        use winit::{data_transfer::TypeHint, event::WindowEvent, event_loop::DndAction};
+        match event {
+            WindowEvent::DragEntered { id, .. } => {
+                if let Ok(transfer) = event_loop.data_transfer(*id)
+                    && transfer
+                        .available_types()
+                        .iter()
+                        .any(|ty| ty.hint() == Some(TypeHint::UriList))
+                {
+                    if let Err(err) = event_loop.set_valid_dnd_actions(*id, &[DndAction::Copy]) {
+                        log::warn!("Could not accept file drop: {err}");
+                    }
+                    self.egui_input.hovered_files = vec![egui::HoveredFile {
+                        mime: "text/uri-list".into(),
+                        ..Default::default()
+                    }];
+                }
+            }
+            WindowEvent::DragDropped { id, .. } => {
+                self.egui_input.hovered_files.clear();
+                match event_loop.fetch_data_transfer(*id, &TypeHint::UriList) {
+                    Ok(serial) => {
+                        self.pending_drops.insert(serial, *id);
+                    }
+                    Err(err) => log::warn!("Could not read file drop: {err}"),
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            WindowEvent::DataTransferReceived { id, serial, value }
+                if self.pending_drops.get(serial) == Some(id) =>
+            {
+                match value.try_as_uris() {
+                    Ok(uris) => {
+                        self.pending_drops.remove(serial);
+                        for uri in uris {
+                            if let Ok(url) = url::Url::parse(&uri)
+                                && let Ok(path) = url.to_file_path()
+                            {
+                                self.egui_input
+                                    .dropped_files
+                                    .push(std::sync::Arc::new(NativeFile::from(path)));
+                            }
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(err) => {
+                        self.pending_drops.remove(serial);
+                        log::warn!("Could not decode file drop: {err}");
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut response = self.on_window_event(window, event);
+        if matches!(
+            event,
+            WindowEvent::DragEntered { .. }
+                | WindowEvent::DragDropped { .. }
+                | WindowEvent::DataTransferReceived { .. }
+        ) {
+            response.repaint = true;
+        }
+        response
+    }
+
     /// Call this when there is a new event.
     ///
     /// The result can be found in [`Self::egui_input`] and be extracted with [`Self::take_egui_input`].
     pub fn on_window_event(
         &mut self,
-        window: &Window,
+        window: &dyn Window,
         event: &winit::event::WindowEvent,
     ) -> EventResponse {
         profiling::function_scope!(short_window_event_description(event));
@@ -364,7 +443,7 @@ impl State {
 
         #[cfg(target_os = "ios")]
         match &event {
-            WindowEvent::Resized(_)
+            WindowEvent::SurfaceResized(_)
             | WindowEvent::ScaleFactorChanged { .. }
             | WindowEvent::Focused(true)
             | WindowEvent::Occluded(false) => {
@@ -391,52 +470,24 @@ impl State {
                     consumed: false,
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => {
-                self.on_mouse_button_input(*state, *button);
+            WindowEvent::PointerMoved { .. }
+            | WindowEvent::PointerButton { .. }
+            | WindowEvent::PointerEntered { .. }
+            | WindowEvent::PointerLeft { .. } => {
+                self.on_pointer_event(event, pixels_per_point(&self.egui_ctx, window))
+            }
+            WindowEvent::MouseWheel {
+                delta,
+                phase,
+                source,
+                ..
+            } => {
+                self.on_mouse_wheel(window, *delta, *phase, *source);
                 EventResponse {
                     repaint: true,
                     consumed: self.egui_ctx.egui_wants_pointer_input(),
                 }
             }
-            WindowEvent::MouseWheel { delta, phase, .. } => {
-                self.on_mouse_wheel(window, *delta, *phase);
-                EventResponse {
-                    repaint: true,
-                    consumed: self.egui_ctx.egui_wants_pointer_input(),
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.on_cursor_moved(window, *position);
-                EventResponse {
-                    repaint: true,
-                    consumed: self.egui_ctx.egui_is_using_pointer(),
-                }
-            }
-            WindowEvent::CursorLeft { .. } => {
-                self.pointer_pos_in_points = None;
-                self.egui_input.events.push(egui::Event::PointerGone);
-                EventResponse {
-                    repaint: true,
-                    consumed: false,
-                }
-            }
-            // WindowEvent::TouchpadPressure {device_id, pressure, stage, ..  } => {} // TODO(emilk)
-            WindowEvent::Touch(touch) => {
-                self.on_touch(window, touch);
-                let consumed = match touch.phase {
-                    winit::event::TouchPhase::Started
-                    | winit::event::TouchPhase::Ended
-                    | winit::event::TouchPhase::Cancelled => {
-                        self.egui_ctx.egui_wants_pointer_input()
-                    }
-                    winit::event::TouchPhase::Moved => self.egui_ctx.egui_is_using_pointer(),
-                };
-                EventResponse {
-                    repaint: true,
-                    consumed,
-                }
-            }
-
             WindowEvent::Ime(ime) => {
                 self.on_ime(ime);
 
@@ -510,48 +561,20 @@ impl State {
                     consumed: false,
                 }
             }
-            WindowEvent::HoveredFile(path) => {
-                self.egui_input.hovered_files.push(egui::HoveredFile {
-                    path: Some(path.clone()),
-                    ..Default::default()
-                });
-                EventResponse {
-                    repaint: true,
-                    consumed: false,
-                }
-            }
-            WindowEvent::HoveredFileCancelled => {
+            WindowEvent::DragLeft { .. } => {
                 self.egui_input.hovered_files.clear();
                 EventResponse {
                     repaint: true,
                     consumed: false,
                 }
             }
-            #[cfg(not(target_arch = "wasm32"))]
-            WindowEvent::DroppedFile(path) => {
-                self.egui_input.hovered_files.clear();
-                self.egui_input
-                    .dropped_files
-                    .push(std::sync::Arc::new(NativeFile::from(path.clone())));
-                EventResponse {
-                    repaint: true,
-                    consumed: false,
-                }
-            }
-            // Winit's web backend does not emit file-drop events. Browser file reads
-            // require a browser file handle, which this path-only event cannot provide.
-            #[cfg(target_arch = "wasm32")]
-            WindowEvent::DroppedFile(_) => EventResponse {
-                repaint: false,
-                consumed: false,
-            },
             WindowEvent::ModifiersChanged(state) => {
                 let state = state.state();
 
                 let alt = state.alt_key();
                 let ctrl = state.control_key();
                 let shift = state.shift_key();
-                let super_ = state.super_key();
+                let super_ = state.meta_key();
 
                 self.modifiers.alt = alt;
                 self.modifiers.ctrl = ctrl;
@@ -575,10 +598,9 @@ impl State {
 
             // Things that may require repaint:
             WindowEvent::RedrawRequested
-            | WindowEvent::CursorEntered { .. }
             | WindowEvent::Destroyed
             | WindowEvent::Occluded(_)
-            | WindowEvent::Resized(_)
+            | WindowEvent::SurfaceResized(_)
             | WindowEvent::Moved(_)
             | WindowEvent::TouchpadPressure { .. }
             | WindowEvent::CloseRequested => EventResponse {
@@ -587,12 +609,12 @@ impl State {
             },
 
             // Things we completely ignore:
-            WindowEvent::ActivationTokenDone { .. }
-            | WindowEvent::AxisMotion { .. }
-            | WindowEvent::DoubleTapGesture { .. } => EventResponse {
-                repaint: false,
-                consumed: false,
-            },
+            WindowEvent::ActivationTokenDone { .. } | WindowEvent::DoubleTapGesture { .. } => {
+                EventResponse {
+                    repaint: false,
+                    consumed: false,
+                }
+            }
 
             WindowEvent::PinchGesture { delta, .. } => {
                 // Positive delta values indicate magnification (zooming in).
@@ -633,6 +655,10 @@ impl State {
                     consumed: self.egui_ctx.egui_wants_pointer_input(),
                 }
             }
+            _ => EventResponse {
+                repaint: false,
+                consumed: false,
+            },
         }
     }
 
@@ -783,7 +809,9 @@ impl State {
             // [`winit::event::Ime::Enabled`] means different things in X11 and
             // Wayland, but it doesn't matter to us.
             // See <https://github.com/rust-windowing/winit/issues/2498>
-            winit::event::Ime::Enabled | winit::event::Ime::Disabled => {}
+            winit::event::Ime::Enabled
+            | winit::event::Ime::Disabled
+            | winit::event::Ime::DeleteSurrounding { .. } => {}
             winit::event::Ime::Preedit(text, active_range_bytes) => {
                 let active_range_chars = match *active_range_bytes {
                     Some((start_bytes, end_bytes)) => {
@@ -828,7 +856,7 @@ impl State {
         }
     }
 
-    /// Forward raw mouse motion (e.g. `winit::event::DeviceEvent::MouseMotion`) to egui
+    /// Forward raw pointer motion (e.g. `winit::event::DeviceEvent::PointerMotion`) to egui
     /// as [`egui::Event::MouseMoved`].
     ///
     /// The motion is ignored unless the pointer is inside the window or a pointer button is held down,
@@ -836,7 +864,7 @@ impl State {
     ///
     /// Returns `true` if the event was sent to egui.
     pub fn on_mouse_motion(&mut self, delta: (f64, f64)) -> bool {
-        if !self.is_pointer_in_window() && !self.any_pointer_button_down {
+        if !self.is_pointer_in_window() && !self.is_any_pointer_button_down() {
             return false;
         }
 
@@ -923,13 +951,199 @@ impl State {
         }
     }
 
-    fn on_cursor_moved(
+    fn on_pointer_event(
         &mut self,
-        window: &Window,
-        pos_in_pixels: winit::dpi::PhysicalPosition<f64>,
-    ) {
-        let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
+        event: &winit::event::WindowEvent,
+        pixels_per_point: f32,
+    ) -> EventResponse {
+        use winit::event::{
+            ButtonSource, PointerKind, PointerSource, TabletToolButton, WindowEvent,
+        };
+        let to_points = |position: PhysicalPosition<f64>| {
+            egui::pos2(
+                position.x as f32 / pixels_per_point,
+                position.y as f32 / pixels_per_point,
+            )
+        };
+        let mut consumed = self.egui_ctx.egui_wants_pointer_input();
+        match event {
+            WindowEvent::PointerMoved {
+                device_id,
+                position,
+                primary,
+                source,
+            } => {
+                match source {
+                    PointerSource::Touch { finger_id, force } => {
+                        let key = (*device_id, *finger_id);
+                        if let Some(pos) = self.touches.get_mut(&key) {
+                            *pos = to_points(*position);
+                            self.push_touch(
+                                *device_id,
+                                finger_id.into_raw() as u64,
+                                egui::TouchPhase::Move,
+                                to_points(*position),
+                                *force,
+                            );
+                        }
+                    }
+                    PointerSource::TabletTool { data, .. } if self.pen_down => {
+                        self.push_touch(
+                            *device_id,
+                            u64::MAX,
+                            egui::TouchPhase::Move,
+                            to_points(*position),
+                            data.force,
+                        );
+                    }
+                    _ => {}
+                }
+                if *primary {
+                    self.on_cursor_moved(*position, pixels_per_point);
+                }
+                consumed = self.egui_ctx.egui_is_using_pointer();
+            }
+            WindowEvent::PointerButton {
+                device_id,
+                state,
+                position,
+                primary,
+                button,
+                ..
+            } => {
+                let pressed = state.is_pressed();
+                let phase = if pressed {
+                    egui::TouchPhase::Start
+                } else {
+                    egui::TouchPhase::End
+                };
+                match button {
+                    ButtonSource::Touch { finger_id, force } => {
+                        let key = (*device_id, *finger_id);
+                        if pressed {
+                            self.touches.insert(key, to_points(*position));
+                            if *primary {
+                                self.pointer_touch_id = Some(key);
+                            }
+                        } else {
+                            self.touches.remove(&key);
+                            if self.pointer_touch_id == Some(key) {
+                                self.pointer_touch_id = None;
+                            }
+                        }
+                        self.push_touch(
+                            *device_id,
+                            finger_id.into_raw() as u64,
+                            phase,
+                            to_points(*position),
+                            *force,
+                        );
+                    }
+                    ButtonSource::TabletTool {
+                        button: TabletToolButton::Contact,
+                        data,
+                        ..
+                    } => {
+                        self.pen_down = pressed;
+                        self.push_touch(
+                            *device_id,
+                            u64::MAX,
+                            phase,
+                            to_points(*position),
+                            data.force,
+                        );
+                    }
+                    _ => {}
+                }
+                if *primary {
+                    if self.pointer_pos_in_points != Some(to_points(*position)) {
+                        self.on_cursor_moved(*position, pixels_per_point);
+                    }
+                    if let Some(button) = button.clone().mouse_button() {
+                        self.on_mouse_button_input(*state, button);
+                    }
+                }
+            }
+            WindowEvent::PointerEntered { .. } => {
+                consumed = false;
+            }
+            WindowEvent::PointerLeft {
+                device_id,
+                primary,
+                kind,
+                position,
+            } => {
+                match kind {
+                    PointerKind::Touch(finger_id) => {
+                        let key = (*device_id, *finger_id);
+                        if let Some(pos) = self.touches.remove(&key) {
+                            self.push_touch(
+                                *device_id,
+                                finger_id.into_raw() as u64,
+                                egui::TouchPhase::Cancel,
+                                pos,
+                                None,
+                            );
+                            if self.pointer_touch_id == Some(key) {
+                                self.pointer_touch_id = None;
+                                self.on_mouse_button_input(
+                                    ElementState::Released,
+                                    winit::event::MouseButton::Left,
+                                );
+                            }
+                        }
+                    }
+                    PointerKind::TabletTool(_) if self.pen_down => {
+                        self.pen_down = false;
+                        let pos = position.map(to_points).or(self.pointer_pos_in_points);
+                        if let Some(pos) = pos {
+                            self.push_touch(
+                                *device_id,
+                                u64::MAX,
+                                egui::TouchPhase::Cancel,
+                                pos,
+                                None,
+                            );
+                        }
+                        self.on_mouse_button_input(
+                            ElementState::Released,
+                            winit::event::MouseButton::Left,
+                        );
+                    }
+                    _ => {}
+                }
+                if *primary {
+                    self.pointer_pos_in_points = None;
+                    self.egui_input.events.push(egui::Event::PointerGone);
+                }
+                consumed = false;
+            }
+            _ => {}
+        }
+        EventResponse {
+            repaint: true,
+            consumed,
+        }
+    }
 
+    fn push_touch(
+        &mut self,
+        device_id: Option<winit::event::DeviceId>,
+        id: u64,
+        phase: egui::TouchPhase,
+        pos: Pos2,
+        force: Option<winit::event::Force>,
+    ) {
+        self.egui_input.events.push(egui::Event::Touch {
+            device_id: egui::TouchDeviceId(egui::epaint::util::hash(device_id)),
+            id: egui::TouchId(id),
+            phase,
+            pos,
+            force: force.map(|force| force.normalized(None) as f32),
+        });
+    }
+
+    fn on_cursor_moved(&mut self, pos_in_pixels: PhysicalPosition<f64>, pixels_per_point: f32) {
         let pos_in_points = egui::pos2(
             pos_in_pixels.x as f32 / pixels_per_point,
             pos_in_pixels.y as f32 / pixels_per_point,
@@ -956,72 +1170,12 @@ impl State {
                 .push(egui::Event::PointerMoved(pos_in_points));
         }
     }
-
-    fn on_touch(&mut self, window: &Window, touch: &winit::event::Touch) {
-        let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
-
-        // Emit touch event
-        self.egui_input.events.push(egui::Event::Touch {
-            device_id: egui::TouchDeviceId(egui::epaint::util::hash(touch.device_id)),
-            id: egui::TouchId::from(touch.id),
-            phase: to_egui_touch_phase(touch.phase),
-            pos: egui::pos2(
-                touch.location.x as f32 / pixels_per_point,
-                touch.location.y as f32 / pixels_per_point,
-            ),
-            force: match touch.force {
-                Some(winit::event::Force::Normalized(force)) => Some(force as f32),
-                Some(winit::event::Force::Calibrated {
-                    force,
-                    max_possible_force,
-                    ..
-                }) => Some((force / max_possible_force) as f32),
-                None => None,
-            },
-        });
-        // If we're not yet translating a touch or we're translating this very
-        // touch …
-        if self.pointer_touch_id.is_none() || self.pointer_touch_id.unwrap_or_default() == touch.id
-        {
-            // … emit PointerButton resp. PointerMoved events to emulate mouse
-            match touch.phase {
-                winit::event::TouchPhase::Started => {
-                    self.pointer_touch_id = Some(touch.id);
-                    // First move the pointer to the right location
-                    self.on_cursor_moved(window, touch.location);
-                    self.on_mouse_button_input(
-                        winit::event::ElementState::Pressed,
-                        winit::event::MouseButton::Left,
-                    );
-                }
-                winit::event::TouchPhase::Moved => {
-                    self.on_cursor_moved(window, touch.location);
-                }
-                winit::event::TouchPhase::Ended => {
-                    self.pointer_touch_id = None;
-                    self.on_mouse_button_input(
-                        winit::event::ElementState::Released,
-                        winit::event::MouseButton::Left,
-                    );
-                    // The pointer should vanish completely to not get any
-                    // hover effects
-                    self.pointer_pos_in_points = None;
-                    self.egui_input.events.push(egui::Event::PointerGone);
-                }
-                winit::event::TouchPhase::Cancelled => {
-                    self.pointer_touch_id = None;
-                    self.pointer_pos_in_points = None;
-                    self.egui_input.events.push(egui::Event::PointerGone);
-                }
-            }
-        }
-    }
-
     fn on_mouse_wheel(
         &mut self,
-        window: &Window,
+        window: &dyn Window,
         delta: winit::event::MouseScrollDelta,
         phase: winit::event::TouchPhase,
+        source: winit::event::ScrollSource,
     ) {
         let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
 
@@ -1037,32 +1191,15 @@ impl State {
                     egui::MouseWheelUnit::Point,
                     egui::vec2(x as f32, y as f32) / pixels_per_point,
                 ),
+                _ => return,
             };
             let phase = to_egui_touch_phase(phase);
             let modifiers = self.modifiers;
 
-            // winit doesn't tell us what is driving the scroll, and collapses the macOS
-            // momentum phase into the regular `TouchPhase`, so we detect that ourselves.
-            // TODO(emilk): use `WindowEvent::MouseWheel::source` once we are on a winit
-            // with https://github.com/rust-windowing/winit/pull/4732
-            let source = cfg_select! {
-                target_os = "macos" => {
-                    if self
-                        .scroll_momentum_monitor
-                        .as_ref()
-                        .is_some_and(|monitor| monitor.latest_scroll_event_is_momentum())
-                    {
-                        egui::MouseWheelSource::Momentum
-                    } else {
-                        // On macOS, only trackpads (and the Magic Mouse) report precise deltas:
-                        match unit {
-                            egui::MouseWheelUnit::Point => egui::MouseWheelSource::Trackpad,
-                            egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => {
-                                egui::MouseWheelSource::Wheel
-                            }
-                        }
-                    }
-                }
+            let source = match source {
+                winit::event::ScrollSource::Wheel => egui::MouseWheelSource::Wheel,
+                winit::event::ScrollSource::Finger => egui::MouseWheelSource::Trackpad,
+                winit::event::ScrollSource::Momentum => egui::MouseWheelSource::Momentum,
                 _ => egui::MouseWheelSource::Unknown,
             };
 
@@ -1194,7 +1331,7 @@ impl State {
     /// *
     pub fn handle_platform_output(
         &mut self,
-        window: &Window,
+        window: &dyn Window,
         platform_output: egui::PlatformOutput,
     ) {
         self.handle_platform_output_inner(window, None, platform_output);
@@ -1209,8 +1346,8 @@ impl State {
     /// path still runs.
     pub fn handle_platform_output_with_event_loop(
         &mut self,
-        window: &Window,
-        event_loop: &ActiveEventLoop,
+        window: &dyn Window,
+        event_loop: &dyn ActiveEventLoop,
         platform_output: egui::PlatformOutput,
     ) {
         self.handle_platform_output_inner(window, Some(event_loop), platform_output);
@@ -1218,8 +1355,8 @@ impl State {
 
     fn handle_platform_output_inner(
         &mut self,
-        window: &Window,
-        event_loop: Option<&ActiveEventLoop>,
+        window: &dyn Window,
+        event_loop: Option<&dyn ActiveEventLoop>,
         platform_output: egui::PlatformOutput,
     ) {
         profiling::function_scope!();
@@ -1295,14 +1432,16 @@ impl State {
                 self.ime_cursor_rect_px = Some(ime_cursor_rect_px);
                 profiling::scope!("set_ime_cursor_area");
                 window.set_ime_cursor_area(
-                    winit::dpi::PhysicalPosition {
+                    (winit::dpi::PhysicalPosition {
                         x: ime_cursor_rect_px.min.x,
                         y: ime_cursor_rect_px.min.y,
-                    },
-                    winit::dpi::PhysicalSize {
+                    })
+                    .into(),
+                    (winit::dpi::PhysicalSize {
                         width: ime_cursor_rect_px.width(),
                         height: ime_cursor_rect_px.height(),
-                    },
+                    })
+                    .into(),
                 );
             }
         } else {
@@ -1327,8 +1466,8 @@ impl State {
     /// did, on the appropriate cache key for whichever path is active.
     fn apply_cursor(
         &mut self,
-        window: &Window,
-        event_loop: Option<&ActiveEventLoop>,
+        window: &dyn Window,
+        event_loop: Option<&dyn ActiveEventLoop>,
         cursor_icon: egui::CursorIcon,
         cursor_image: Option<&egui::CustomCursorImage>,
     ) {
@@ -1356,7 +1495,7 @@ impl State {
 
             let custom = match cached {
                 Some(c) => c,
-                None => match winit::window::CustomCursor::from_rgba(
+                None => match winit::cursor::CustomCursorSource::from_rgba(
                     image.rgba.to_vec(),
                     image.size[0],
                     image.size[1],
@@ -1364,7 +1503,14 @@ impl State {
                     image.hotspot[1],
                 ) {
                     Ok(source) => {
-                        let c = event_loop.create_custom_cursor(source);
+                        let c = match event_loop.create_custom_cursor(source) {
+                            Ok(cursor) => cursor,
+                            Err(err) => {
+                                log::warn!("Failed to create custom cursor: {err}");
+                                self.set_cursor_icon_inner(window, cursor_icon);
+                                return;
+                            }
+                        };
                         self.current_custom_cursor = Some((key, c.clone()));
                         c
                     }
@@ -1380,7 +1526,7 @@ impl State {
             };
 
             window.set_cursor_visible(true);
-            window.set_cursor(custom);
+            window.set_cursor(custom.into());
             // Resync `current_cursor_icon` so the next icon-only path
             // notices a real change rather than dedupe-skipping it.
             self.current_cursor_icon = None;
@@ -1393,7 +1539,7 @@ impl State {
 
     /// Icon-only path, factored out so `apply_cursor` can fall back to it
     /// when the bitmap path bails. Preserves the original dedupe.
-    fn set_cursor_icon_inner(&mut self, window: &Window, cursor_icon: egui::CursorIcon) {
+    fn set_cursor_icon_inner(&mut self, window: &dyn Window, cursor_icon: egui::CursorIcon) {
         if self.current_cursor_icon == Some(cursor_icon) {
             // Prevent flickering near frame boundary when Windows OS tries to control cursor icon for window resizing.
             // On other platforms: just early-out to save CPU.
@@ -1404,7 +1550,7 @@ impl State {
 
         if let Some(winit_cursor_icon) = translate_cursor(cursor_icon) {
             window.set_cursor_visible(true);
-            window.set_cursor(winit_cursor_icon);
+            window.set_cursor(winit_cursor_icon.into());
         } else {
             window.set_cursor_visible(false);
         }
@@ -1427,11 +1573,16 @@ fn to_egui_theme(theme: winit::window::Theme) -> Theme {
     }
 }
 
-pub fn inner_rect_in_points(window: &Window, pixels_per_point: f32) -> Option<Rect> {
-    let inner_pos_px = window.inner_position().ok()?;
+pub fn inner_rect_in_points(window: &dyn Window, pixels_per_point: f32) -> Option<Rect> {
+    let outer_pos_px = window.outer_position().ok()?;
+    let surface_pos_px = window.surface_position();
+    let inner_pos_px = PhysicalPosition::new(
+        outer_pos_px.x + surface_pos_px.x,
+        outer_pos_px.y + surface_pos_px.y,
+    );
     let inner_pos_px = egui::pos2(inner_pos_px.x as f32, inner_pos_px.y as f32);
 
-    let inner_size_px = window.inner_size();
+    let inner_size_px = window.surface_size();
     let inner_size_px = egui::vec2(inner_size_px.width as f32, inner_size_px.height as f32);
 
     let inner_rect_px = egui::Rect::from_min_size(inner_pos_px, inner_size_px);
@@ -1439,7 +1590,7 @@ pub fn inner_rect_in_points(window: &Window, pixels_per_point: f32) -> Option<Re
     Some(inner_rect_px / pixels_per_point)
 }
 
-pub fn outer_rect_in_points(window: &Window, pixels_per_point: f32) -> Option<Rect> {
+pub fn outer_rect_in_points(window: &dyn Window, pixels_per_point: f32) -> Option<Rect> {
     let outer_pos_px = window.outer_position().ok()?;
     let outer_pos_px = egui::pos2(outer_pos_px.x as f32, outer_pos_px.y as f32);
 
@@ -1459,7 +1610,7 @@ pub fn outer_rect_in_points(window: &Window, pixels_per_point: f32) -> Option<Re
 pub fn update_viewport_info(
     viewport_info: &mut ViewportInfo,
     egui_ctx: &egui::Context,
-    window: &Window,
+    window: &dyn Window,
     is_init: bool,
 ) {
     profiling::function_scope!();
@@ -1485,8 +1636,10 @@ pub fn update_viewport_info(
     let monitor_size = {
         profiling::scope!("monitor_size");
         if let Some(monitor) = window.current_monitor() {
-            let size = monitor.size().to_logical::<f32>(pixels_per_point.into());
-            Some(egui::vec2(size.width, size.height))
+            monitor.current_video_mode().map(|mode| {
+                let size = mode.size().to_logical::<f32>(pixels_per_point.into());
+                egui::vec2(size.width, size.height)
+            })
         } else {
             None
         }
@@ -1560,7 +1713,7 @@ fn translate_mouse_button(button: winit::event::MouseButton) -> Option<egui::Poi
         winit::event::MouseButton::Middle => Some(egui::PointerButton::Middle),
         winit::event::MouseButton::Back => Some(egui::PointerButton::Extra1),
         winit::event::MouseButton::Forward => Some(egui::PointerButton::Extra2),
-        winit::event::MouseButton::Other(_) => None,
+        _ => None,
     }
 }
 
@@ -1594,8 +1747,6 @@ fn key_from_named_key(named_key: winit::keyboard::NamedKey) -> Option<egui::Key>
         NamedKey::Cut => Key::Cut,
         NamedKey::Copy => Key::Copy,
         NamedKey::Paste => Key::Paste,
-
-        NamedKey::Space => Key::Space,
 
         NamedKey::F1 => Key::F1,
         NamedKey::F2 => Key::F2,
@@ -1800,8 +1951,8 @@ fn key_from_key_code(key: winit::keyboard::KeyCode) -> Option<egui::Key> {
         KeyCode::ControlRight => Key::ControlRight,
         KeyCode::AltLeft => Key::AltLeft,
         KeyCode::AltRight => Key::AltRight,
-        KeyCode::SuperLeft => Key::SuperLeft,
-        KeyCode::SuperRight => Key::SuperRight,
+        KeyCode::MetaLeft => Key::SuperLeft,
+        KeyCode::MetaRight => Key::SuperRight,
 
         // ISO 102nd key — `<>|` on French AZERTY, `\|` on UK QWERTY.
         KeyCode::IntlBackslash => Key::IntlBackslash,
@@ -1850,47 +2001,47 @@ fn key_from_key_code(key: winit::keyboard::KeyCode) -> Option<egui::Key> {
     })
 }
 
-fn translate_cursor(cursor_icon: egui::CursorIcon) -> Option<winit::window::CursorIcon> {
+fn translate_cursor(cursor_icon: egui::CursorIcon) -> Option<winit::cursor::CursorIcon> {
     match cursor_icon {
         egui::CursorIcon::None => None,
 
-        egui::CursorIcon::Alias => Some(winit::window::CursorIcon::Alias),
-        egui::CursorIcon::AllScroll => Some(winit::window::CursorIcon::AllScroll),
-        egui::CursorIcon::Cell => Some(winit::window::CursorIcon::Cell),
-        egui::CursorIcon::ContextMenu => Some(winit::window::CursorIcon::ContextMenu),
-        egui::CursorIcon::Copy => Some(winit::window::CursorIcon::Copy),
-        egui::CursorIcon::Crosshair => Some(winit::window::CursorIcon::Crosshair),
-        egui::CursorIcon::Default => Some(winit::window::CursorIcon::Default),
-        egui::CursorIcon::Grab => Some(winit::window::CursorIcon::Grab),
-        egui::CursorIcon::Grabbing => Some(winit::window::CursorIcon::Grabbing),
-        egui::CursorIcon::Help => Some(winit::window::CursorIcon::Help),
-        egui::CursorIcon::Move => Some(winit::window::CursorIcon::Move),
-        egui::CursorIcon::NoDrop => Some(winit::window::CursorIcon::NoDrop),
-        egui::CursorIcon::NotAllowed => Some(winit::window::CursorIcon::NotAllowed),
-        egui::CursorIcon::PointingHand => Some(winit::window::CursorIcon::Pointer),
-        egui::CursorIcon::Progress => Some(winit::window::CursorIcon::Progress),
+        egui::CursorIcon::Alias => Some(winit::cursor::CursorIcon::Alias),
+        egui::CursorIcon::AllScroll => Some(winit::cursor::CursorIcon::AllScroll),
+        egui::CursorIcon::Cell => Some(winit::cursor::CursorIcon::Cell),
+        egui::CursorIcon::ContextMenu => Some(winit::cursor::CursorIcon::ContextMenu),
+        egui::CursorIcon::Copy => Some(winit::cursor::CursorIcon::Copy),
+        egui::CursorIcon::Crosshair => Some(winit::cursor::CursorIcon::Crosshair),
+        egui::CursorIcon::Default => Some(winit::cursor::CursorIcon::Default),
+        egui::CursorIcon::Grab => Some(winit::cursor::CursorIcon::Grab),
+        egui::CursorIcon::Grabbing => Some(winit::cursor::CursorIcon::Grabbing),
+        egui::CursorIcon::Help => Some(winit::cursor::CursorIcon::Help),
+        egui::CursorIcon::Move => Some(winit::cursor::CursorIcon::Move),
+        egui::CursorIcon::NoDrop => Some(winit::cursor::CursorIcon::NoDrop),
+        egui::CursorIcon::NotAllowed => Some(winit::cursor::CursorIcon::NotAllowed),
+        egui::CursorIcon::PointingHand => Some(winit::cursor::CursorIcon::Pointer),
+        egui::CursorIcon::Progress => Some(winit::cursor::CursorIcon::Progress),
 
-        egui::CursorIcon::ResizeHorizontal => Some(winit::window::CursorIcon::EwResize),
-        egui::CursorIcon::ResizeNeSw => Some(winit::window::CursorIcon::NeswResize),
-        egui::CursorIcon::ResizeNwSe => Some(winit::window::CursorIcon::NwseResize),
-        egui::CursorIcon::ResizeVertical => Some(winit::window::CursorIcon::NsResize),
+        egui::CursorIcon::ResizeHorizontal => Some(winit::cursor::CursorIcon::EwResize),
+        egui::CursorIcon::ResizeNeSw => Some(winit::cursor::CursorIcon::NeswResize),
+        egui::CursorIcon::ResizeNwSe => Some(winit::cursor::CursorIcon::NwseResize),
+        egui::CursorIcon::ResizeVertical => Some(winit::cursor::CursorIcon::NsResize),
 
-        egui::CursorIcon::ResizeEast => Some(winit::window::CursorIcon::EResize),
-        egui::CursorIcon::ResizeSouthEast => Some(winit::window::CursorIcon::SeResize),
-        egui::CursorIcon::ResizeSouth => Some(winit::window::CursorIcon::SResize),
-        egui::CursorIcon::ResizeSouthWest => Some(winit::window::CursorIcon::SwResize),
-        egui::CursorIcon::ResizeWest => Some(winit::window::CursorIcon::WResize),
-        egui::CursorIcon::ResizeNorthWest => Some(winit::window::CursorIcon::NwResize),
-        egui::CursorIcon::ResizeNorth => Some(winit::window::CursorIcon::NResize),
-        egui::CursorIcon::ResizeNorthEast => Some(winit::window::CursorIcon::NeResize),
-        egui::CursorIcon::ResizeColumn => Some(winit::window::CursorIcon::ColResize),
-        egui::CursorIcon::ResizeRow => Some(winit::window::CursorIcon::RowResize),
+        egui::CursorIcon::ResizeEast => Some(winit::cursor::CursorIcon::EResize),
+        egui::CursorIcon::ResizeSouthEast => Some(winit::cursor::CursorIcon::SeResize),
+        egui::CursorIcon::ResizeSouth => Some(winit::cursor::CursorIcon::SResize),
+        egui::CursorIcon::ResizeSouthWest => Some(winit::cursor::CursorIcon::SwResize),
+        egui::CursorIcon::ResizeWest => Some(winit::cursor::CursorIcon::WResize),
+        egui::CursorIcon::ResizeNorthWest => Some(winit::cursor::CursorIcon::NwResize),
+        egui::CursorIcon::ResizeNorth => Some(winit::cursor::CursorIcon::NResize),
+        egui::CursorIcon::ResizeNorthEast => Some(winit::cursor::CursorIcon::NeResize),
+        egui::CursorIcon::ResizeColumn => Some(winit::cursor::CursorIcon::ColResize),
+        egui::CursorIcon::ResizeRow => Some(winit::cursor::CursorIcon::RowResize),
 
-        egui::CursorIcon::Text => Some(winit::window::CursorIcon::Text),
-        egui::CursorIcon::VerticalText => Some(winit::window::CursorIcon::VerticalText),
-        egui::CursorIcon::Wait => Some(winit::window::CursorIcon::Wait),
-        egui::CursorIcon::ZoomIn => Some(winit::window::CursorIcon::ZoomIn),
-        egui::CursorIcon::ZoomOut => Some(winit::window::CursorIcon::ZoomOut),
+        egui::CursorIcon::Text => Some(winit::cursor::CursorIcon::Text),
+        egui::CursorIcon::VerticalText => Some(winit::cursor::CursorIcon::VerticalText),
+        egui::CursorIcon::Wait => Some(winit::cursor::CursorIcon::Wait),
+        egui::CursorIcon::ZoomIn => Some(winit::cursor::CursorIcon::ZoomIn),
+        egui::CursorIcon::ZoomOut => Some(winit::cursor::CursorIcon::ZoomOut),
     }
 }
 
@@ -1928,7 +2079,7 @@ pub fn process_viewport_commands(
     egui_ctx: &egui::Context,
     info: &mut ViewportInfo,
     commands: impl IntoIterator<Item = ViewportCommand>,
-    window: &Window,
+    window: &dyn Window,
     actions_requested: &mut Vec<ActionRequested>,
 ) {
     for command in commands {
@@ -1938,7 +2089,7 @@ pub fn process_viewport_commands(
 
 fn process_viewport_command(
     egui_ctx: &egui::Context,
-    window: &Window,
+    window: &dyn Window,
     command: ViewportCommand,
     info: &mut ViewportInfo,
     actions_requested: &mut Vec<ActionRequested>,
@@ -1970,7 +2121,8 @@ fn process_viewport_command(
             let width_px = pixels_per_point * size.x.max(1.0);
             let height_px = pixels_per_point * size.y.max(1.0);
             let requested_size = PhysicalSize::new(width_px, height_px);
-            if let Some(_returned_inner_size) = window.request_inner_size(requested_size) {
+            if let Some(_returned_inner_size) = window.request_surface_size((requested_size).into())
+            {
                 // On platforms where the size is entirely controlled by the user the
                 // applied size will be returned immediately, resize event in such case
                 // may not be generated.
@@ -2012,24 +2164,32 @@ fn process_viewport_command(
         ViewportCommand::Transparent(v) => window.set_transparent(v),
         ViewportCommand::Visible(v) => window.set_visible(v),
         ViewportCommand::OuterPosition(pos) => {
-            window.set_outer_position(PhysicalPosition::new(
-                pixels_per_point * pos.x,
-                pixels_per_point * pos.y,
-            ));
+            window.set_outer_position(
+                (PhysicalPosition::new(pixels_per_point * pos.x, pixels_per_point * pos.y)).into(),
+            );
         }
         ViewportCommand::MinInnerSize(s) => {
-            window.set_min_inner_size((s.is_finite() && s != Vec2::ZERO).then_some(
-                PhysicalSize::new(pixels_per_point * s.x, pixels_per_point * s.y),
-            ));
+            window.set_min_surface_size(
+                ((s.is_finite() && s != Vec2::ZERO).then_some(PhysicalSize::new(
+                    pixels_per_point * s.x,
+                    pixels_per_point * s.y,
+                )))
+                .map(Into::into),
+            );
         }
         ViewportCommand::MaxInnerSize(s) => {
-            window.set_max_inner_size((s.is_finite() && s != Vec2::INFINITY).then_some(
-                PhysicalSize::new(pixels_per_point * s.x, pixels_per_point * s.y),
-            ));
+            window.set_max_surface_size(
+                ((s.is_finite() && s != Vec2::INFINITY).then_some(PhysicalSize::new(
+                    pixels_per_point * s.x,
+                    pixels_per_point * s.y,
+                )))
+                .map(Into::into),
+            );
         }
         ViewportCommand::ResizeIncrements(s) => {
-            window.set_resize_increments(
-                s.map(|s| PhysicalSize::new(pixels_per_point * s.x, pixels_per_point * s.y)),
+            window.set_surface_resize_increments(
+                (s.map(|s| PhysicalSize::new(pixels_per_point * s.x, pixels_per_point * s.y)))
+                    .map(Into::into),
             );
         }
         ViewportCommand::Resizable(v) => window.set_resizable(v),
@@ -2061,11 +2221,11 @@ fn process_viewport_command(
             info.maximized = Some(v);
         }
         ViewportCommand::Fullscreen(v) => {
-            window.set_fullscreen(v.then_some(winit::window::Fullscreen::Borderless(None)));
+            window.set_fullscreen(v.then_some(winit::monitor::Fullscreen::Borderless(None)));
         }
         ViewportCommand::SetMonitor(idx) => {
             if let Some(monitor) = window.available_monitors().nth(idx) {
-                window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(monitor))));
+                window.set_fullscreen(Some(winit::monitor::Fullscreen::Borderless(Some(monitor))));
             } else {
                 log::warn!(
                     "ViewportCommand::SetMonitor({idx}): index out of range ({} monitors available)",
@@ -2094,11 +2254,16 @@ fn process_viewport_command(
         }
         ViewportCommand::IMERect(rect) => {
             window.set_ime_cursor_area(
-                PhysicalPosition::new(pixels_per_point * rect.min.x, pixels_per_point * rect.min.y),
-                PhysicalSize::new(
+                (PhysicalPosition::new(
+                    pixels_per_point * rect.min.x,
+                    pixels_per_point * rect.min.y,
+                ))
+                .into(),
+                (PhysicalSize::new(
                     pixels_per_point * rect.size().x,
                     pixels_per_point * rect.size().y,
-                ),
+                ))
+                .into(),
             );
         }
         ViewportCommand::IMEAllowed(v) => window.set_ime_allowed(v),
@@ -2133,10 +2298,9 @@ fn process_viewport_command(
         }
         ViewportCommand::ContentProtected(v) => window.set_content_protected(v),
         ViewportCommand::CursorPosition(pos) => {
-            if let Err(err) = window.set_cursor_position(PhysicalPosition::new(
-                pixels_per_point * pos.x,
-                pixels_per_point * pos.y,
-            )) {
+            if let Err(err) = window.set_cursor_position(
+                (PhysicalPosition::new(pixels_per_point * pos.x, pixels_per_point * pos.y)).into(),
+            ) {
                 log::warn!("{command:?}: {err}");
             }
         }
@@ -2189,19 +2353,19 @@ fn to_winit_ime_purpose(purpose: egui::IMEPurpose) -> winit::window::ImePurpose 
 /// Possible causes of error include denied permission, incompatible system, and lack of memory.
 pub fn create_window(
     egui_ctx: &egui::Context,
-    event_loop: &ActiveEventLoop,
+    event_loop: &dyn ActiveEventLoop,
     viewport_builder: &ViewportBuilder,
-) -> Result<Window, winit::error::OsError> {
+) -> Result<Box<dyn Window>, winit::error::CreateWindowError> {
     profiling::function_scope!();
 
     let window_attributes = apply_monitor_to_window_attributes(
-        create_winit_window_attributes(egui_ctx, viewport_builder.clone()),
+        create_winit_window_attributes(egui_ctx, event_loop, viewport_builder.clone()),
         viewport_builder,
         event_loop,
     );
 
     let window = event_loop.create_window(window_attributes)?;
-    apply_viewport_builder_to_window(egui_ctx, &window, viewport_builder);
+    apply_viewport_builder_to_window(egui_ctx, window.as_ref(), viewport_builder);
     Ok(window)
 }
 
@@ -2219,12 +2383,12 @@ pub fn create_window(
 pub fn apply_monitor_to_window_attributes(
     mut window_attributes: winit::window::WindowAttributes,
     viewport_builder: &ViewportBuilder,
-    event_loop: &ActiveEventLoop,
+    event_loop: &dyn ActiveEventLoop,
 ) -> winit::window::WindowAttributes {
     if let Some(idx) = viewport_builder.monitor {
         if let Some(monitor) = event_loop.available_monitors().nth(idx) {
             window_attributes = window_attributes
-                .with_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(monitor))));
+                .with_fullscreen(Some(winit::monitor::Fullscreen::Borderless(Some(monitor))));
         } else {
             log::warn!(
                 "ViewportBuilder::with_monitor({idx}): index out of range ({} monitors available)",
@@ -2237,6 +2401,7 @@ pub fn apply_monitor_to_window_attributes(
 
 pub fn create_winit_window_attributes(
     egui_ctx: &egui::Context,
+    _event_loop: &dyn ActiveEventLoop,
     viewport_builder: ViewportBuilder,
 ) -> winit::window::WindowAttributes {
     profiling::function_scope!();
@@ -2305,7 +2470,7 @@ pub fn create_winit_window_attributes(
             egui::viewport::WindowLevel::Normal => WindowLevel::Normal,
         })
         .with_fullscreen(
-            fullscreen.and_then(|e| e.then_some(winit::window::Fullscreen::Borderless(None))),
+            fullscreen.and_then(|e| e.then_some(winit::monitor::Fullscreen::Borderless(None))),
         )
         .with_enabled_buttons({
             let mut buttons = WindowButtons::empty();
@@ -2338,17 +2503,21 @@ pub fn create_winit_window_attributes(
 
         if let Some(size) = inner_size {
             window_attributes = window_attributes
-                .with_inner_size(LogicalSize::new(zoom_factor * size.x, zoom_factor * size.y));
+                .with_surface_size(LogicalSize::new(zoom_factor * size.x, zoom_factor * size.y));
         }
 
         if let Some(size) = min_inner_size {
-            window_attributes = window_attributes
-                .with_min_inner_size(LogicalSize::new(zoom_factor * size.x, zoom_factor * size.y));
+            window_attributes = window_attributes.with_min_surface_size(LogicalSize::new(
+                zoom_factor * size.x,
+                zoom_factor * size.y,
+            ));
         }
 
         if let Some(size) = max_inner_size {
-            window_attributes = window_attributes
-                .with_max_inner_size(LogicalSize::new(zoom_factor * size.x, zoom_factor * size.y));
+            window_attributes = window_attributes.with_max_surface_size(LogicalSize::new(
+                zoom_factor * size.x,
+                zoom_factor * size.y,
+            ));
         }
 
         if let Some(pos) = position {
@@ -2374,107 +2543,116 @@ pub fn create_winit_window_attributes(
         window_attributes = window_attributes.with_window_icon(winit_icon);
     }
 
-    #[cfg(all(feature = "wayland", target_os = "linux"))]
-    if let Some(app_id) = _app_id {
-        use winit::platform::wayland::WindowAttributesExtWayland as _;
-        window_attributes = window_attributes.with_name(app_id, "");
-    }
-
-    // Consume the activation token our launcher handed us, so the first
-    // window actually gets the focus.
-    //
-    // A desktop entry with `StartupNotify=true` passes a token through
-    // `XDG_ACTIVATION_TOKEN` (Wayland) or `DESKTOP_STARTUP_ID` (X11), and
-    // winit can only apply it at window creation. eframe never read it, so
-    // under a compositor that enforces focus-stealing prevention the window
-    // opened unfocused and stayed that way: `ViewportCommand::Focus` is
-    // exactly the request such a compositor refuses, so nothing could
-    // recover it and the user had to click the window themselves.
-    //
-    // The variables are cleared once read, per the startup-notification
-    // spec: a token is single-use, and leaving it in the environment would
-    // have every later window — and every child process — replay it.
     #[cfg(all(target_os = "linux", any(feature = "wayland", feature = "x11")))]
     {
-        use winit::platform::startup_notify::{
-            WindowAttributesExtStartupNotify as _, reset_activation_token_env,
-        };
         let token = std::env::var("XDG_ACTIVATION_TOKEN")
             .or_else(|_| std::env::var("DESKTOP_STARTUP_ID"))
             .ok()
-            .filter(|t| !t.is_empty());
-        if let Some(token) = token {
-            log::debug!("using the activation token from the environment to focus the window");
-            reset_activation_token_env();
-            window_attributes = window_attributes
-                .with_activation_token(winit::window::ActivationToken::from_raw(token));
+            .filter(|token| !token.is_empty());
+        if token.is_some() {
+            winit::platform::startup_notify::reset_activation_token_env();
         }
-    }
-
-    #[cfg(all(feature = "x11", target_os = "linux"))]
-    {
-        use winit::platform::x11::WindowAttributesExtX11 as _;
-        if let Some(window_type) = _window_type {
-            use winit::platform::x11::WindowType;
-            window_attributes = window_attributes.with_x11_window_type(vec![match window_type {
-                egui::X11WindowType::Normal => WindowType::Normal,
-                egui::X11WindowType::Utility => WindowType::Utility,
-                egui::X11WindowType::Dock => WindowType::Dock,
-                egui::X11WindowType::Desktop => WindowType::Desktop,
-                egui::X11WindowType::Toolbar => WindowType::Toolbar,
-                egui::X11WindowType::Menu => WindowType::Menu,
-                egui::X11WindowType::Splash => WindowType::Splash,
-                egui::X11WindowType::Dialog => WindowType::Dialog,
-                egui::X11WindowType::DropdownMenu => WindowType::DropdownMenu,
-                egui::X11WindowType::PopupMenu => WindowType::PopupMenu,
-                egui::X11WindowType::Tooltip => WindowType::Tooltip,
-                egui::X11WindowType::Notification => WindowType::Notification,
-                egui::X11WindowType::Combo => WindowType::Combo,
-                egui::X11WindowType::Dnd => WindowType::Dnd,
-            }]);
+        #[cfg(feature = "wayland")]
+        if matches!(
+            _event_loop
+                .rwh_06_handle()
+                .display_handle()
+                .map(|handle| handle.as_raw()),
+            Ok(raw_window_handle::RawDisplayHandle::Wayland(_))
+        ) {
+            let mut platform = winit::platform::wayland::WindowAttributesWayland::default();
+            if let Some(app_id) = _app_id.as_ref() {
+                platform = platform.with_name(app_id, "");
+            }
+            if let Some(token) = token.as_ref() {
+                platform = platform
+                    .with_activation_token(winit::window::ActivationToken::from_raw(token.clone()));
+            }
+            window_attributes = window_attributes.with_platform_attributes(Box::new(platform));
         }
-        if let Some(override_redirect) = _override_redirect {
-            window_attributes = window_attributes.with_override_redirect(override_redirect);
+        #[cfg(feature = "x11")]
+        if matches!(
+            _event_loop
+                .rwh_06_handle()
+                .display_handle()
+                .map(|handle| handle.as_raw()),
+            Ok(raw_window_handle::RawDisplayHandle::Xlib(_)
+                | raw_window_handle::RawDisplayHandle::Xcb(_))
+        ) {
+            let mut platform = winit::platform::x11::WindowAttributesX11::default();
+            if let Some(app_id) = _app_id.as_ref() {
+                platform = platform.with_name(app_id, "");
+            }
+            if let Some(token) = token.as_ref() {
+                platform = platform
+                    .with_activation_token(winit::window::ActivationToken::from_raw(token.clone()));
+            }
+            if let Some(window_type) = _window_type {
+                use winit::platform::x11::WindowType;
+                platform = platform.with_x11_window_type(vec![match window_type {
+                    egui::X11WindowType::Normal => WindowType::Normal,
+                    egui::X11WindowType::Utility => WindowType::Utility,
+                    egui::X11WindowType::Dock => WindowType::Dock,
+                    egui::X11WindowType::Desktop => WindowType::Desktop,
+                    egui::X11WindowType::Toolbar => WindowType::Toolbar,
+                    egui::X11WindowType::Menu => WindowType::Menu,
+                    egui::X11WindowType::Splash => WindowType::Splash,
+                    egui::X11WindowType::Dialog => WindowType::Dialog,
+                    egui::X11WindowType::DropdownMenu => WindowType::DropdownMenu,
+                    egui::X11WindowType::PopupMenu => WindowType::PopupMenu,
+                    egui::X11WindowType::Tooltip => WindowType::Tooltip,
+                    egui::X11WindowType::Notification => WindowType::Notification,
+                    egui::X11WindowType::Combo => WindowType::Combo,
+                    egui::X11WindowType::Dnd => WindowType::Dnd,
+                }]);
+            }
+            if let Some(override_redirect) = _override_redirect {
+                platform = platform.with_override_redirect(override_redirect);
+            }
+            window_attributes = window_attributes.with_platform_attributes(Box::new(platform));
         }
     }
 
     #[cfg(target_os = "windows")]
     {
-        use winit::platform::windows::WindowAttributesExtWindows as _;
+        use winit::platform::windows::WindowAttributesWindows;
+        let mut platform = WindowAttributesWindows::default();
         if let Some(enable) = _drag_and_drop {
-            window_attributes = window_attributes.with_drag_and_drop(enable);
+            platform = platform.with_drag_and_drop(enable);
         }
         if let Some(show) = _taskbar {
-            window_attributes = window_attributes.with_skip_taskbar(!show);
+            platform = platform.with_skip_taskbar(!show);
         }
 
         // don't request the undecorated-window drop shadow in fullscreen (#8399)
         let want_undecorated_shadow = !decorations.unwrap_or(true) && !fullscreen.unwrap_or(false);
-        window_attributes = window_attributes.with_undecorated_shadow(want_undecorated_shadow);
+        platform = platform.with_undecorated_shadow(want_undecorated_shadow);
+        window_attributes = window_attributes.with_platform_attributes(Box::new(platform));
     }
 
     #[cfg(target_os = "macos")]
     {
-        use winit::platform::macos::WindowAttributesExtMacOS as _;
-        window_attributes = window_attributes
+        use winit::platform::macos::WindowAttributesMacOS;
+        let platform = WindowAttributesMacOS::default()
             .with_title_hidden(!_title_shown.unwrap_or(true))
             .with_titlebar_buttons_hidden(!_titlebar_buttons_shown.unwrap_or(true))
             .with_titlebar_transparent(!_titlebar_shown.unwrap_or(true))
             .with_fullsize_content_view(_fullsize_content_view.unwrap_or(false))
             .with_movable_by_window_background(_movable_by_window_background.unwrap_or(false))
             .with_has_shadow(_has_shadow.unwrap_or(true));
+        window_attributes = window_attributes.with_platform_attributes(Box::new(platform));
     }
 
     window_attributes
 }
 
-fn to_winit_icon(icon: &egui::IconData) -> Option<winit::window::Icon> {
+fn to_winit_icon(icon: &egui::IconData) -> Option<winit::icon::Icon> {
     if icon.is_empty() {
         None
     } else {
         profiling::function_scope!();
-        match winit::window::Icon::from_rgba(icon.rgba.clone(), icon.width, icon.height) {
-            Ok(winit_icon) => Some(winit_icon),
+        match winit::icon::RgbaIcon::new(icon.rgba.clone(), icon.width, icon.height) {
+            Ok(winit_icon) => Some(winit_icon.into()),
             Err(err) => {
                 log::warn!("Invalid IconData: {err}");
                 None
@@ -2486,7 +2664,7 @@ fn to_winit_icon(icon: &egui::IconData) -> Option<winit::window::Icon> {
 /// Applies what `create_winit_window_builder` couldn't
 pub fn apply_viewport_builder_to_window(
     egui_ctx: &egui::Context,
-    window: &Window,
+    window: &dyn Window,
     builder: &ViewportBuilder,
 ) {
     if let Some(mouse_passthrough) = builder.mouse_passthrough
@@ -2505,29 +2683,27 @@ pub fn apply_viewport_builder_to_window(
 
         if let Some(size) = builder.inner_size
             && window
-                .request_inner_size(PhysicalSize::new(
-                    pixels_per_point * size.x,
-                    pixels_per_point * size.y,
-                ))
+                .request_surface_size(
+                    (PhysicalSize::new(pixels_per_point * size.x, pixels_per_point * size.y))
+                        .into(),
+                )
                 .is_some()
         {
             log::debug!("Failed to set window size");
         }
         if let Some(size) = builder.min_inner_size {
-            window.set_min_inner_size(Some(PhysicalSize::new(
-                pixels_per_point * size.x,
-                pixels_per_point * size.y,
-            )));
+            window.set_min_surface_size(Some(
+                PhysicalSize::new(pixels_per_point * size.x, pixels_per_point * size.y).into(),
+            ));
         }
         if let Some(size) = builder.max_inner_size {
-            window.set_max_inner_size(Some(PhysicalSize::new(
-                pixels_per_point * size.x,
-                pixels_per_point * size.y,
-            )));
+            window.set_max_surface_size(Some(
+                PhysicalSize::new(pixels_per_point * size.x, pixels_per_point * size.y).into(),
+            ));
         }
         if let Some(pos) = builder.position {
             let pos = PhysicalPosition::new(pixels_per_point * pos.x, pixels_per_point * pos.y);
-            window.set_outer_position(pos);
+            window.set_outer_position(pos.into());
         }
         if let Some(maximized) = builder.maximized {
             set_maximized(window, maximized);
@@ -2536,7 +2712,7 @@ pub fn apply_viewport_builder_to_window(
 }
 
 /// Like [`winit::window::Window::set_maximized`], but doesn't flash a hidden window on Windows.
-pub fn set_maximized(window: &winit::window::Window, maximized: bool) {
+pub fn set_maximized(window: &dyn winit::window::Window, maximized: bool) {
     #[cfg(target_os = "windows")]
     if maximized && window.is_visible() == Some(false) {
         set_maximized_while_hidden(window);
@@ -2555,7 +2731,7 @@ pub fn set_maximized(window: &winit::window::Window, maximized: bool) {
 // TODO(rust-windowing/winit#4575): remove this (and the `with_maximized` special case in
 // `create_winit_window_attributes`) once we are on a winit with that fix (or rust-windowing/winit#4587).
 #[cfg(target_os = "windows")]
-fn set_maximized_while_hidden(window: &winit::window::Window) {
+fn set_maximized_while_hidden(window: &dyn winit::window::Window) {
     use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
     use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
 
@@ -2588,7 +2764,7 @@ fn set_maximized_while_hidden(window: &winit::window::Window) {
 }
 
 #[cfg(target_os = "windows")]
-fn refresh_windows_non_client_activation(window: &winit::window::Window) {
+fn refresh_windows_non_client_activation(window: &dyn winit::window::Window) {
     use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
     use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_NCACTIVATE};
 
@@ -2630,13 +2806,11 @@ pub fn short_device_event_description(event: &winit::event::DeviceEvent) -> &'st
     use winit::event::DeviceEvent;
 
     match event {
-        DeviceEvent::Added => "DeviceEvent::Added",
-        DeviceEvent::Removed => "DeviceEvent::Removed",
-        DeviceEvent::MouseMotion { .. } => "DeviceEvent::MouseMotion",
+        DeviceEvent::PointerMotion { .. } => "DeviceEvent::PointerMotion",
         DeviceEvent::MouseWheel { .. } => "DeviceEvent::MouseWheel",
-        DeviceEvent::Motion { .. } => "DeviceEvent::Motion",
         DeviceEvent::Button { .. } => "DeviceEvent::Button",
         DeviceEvent::Key { .. } => "DeviceEvent::Key",
+        _ => "Event",
     }
 }
 
@@ -2647,32 +2821,31 @@ pub fn short_window_event_description(event: &winit::event::WindowEvent) -> &'st
 
     match event {
         WindowEvent::ActivationTokenDone { .. } => "WindowEvent::ActivationTokenDone",
-        WindowEvent::Resized { .. } => "WindowEvent::Resized",
+        WindowEvent::SurfaceResized { .. } => "WindowEvent::SurfaceResized",
         WindowEvent::Moved { .. } => "WindowEvent::Moved",
         WindowEvent::CloseRequested => "WindowEvent::CloseRequested",
         WindowEvent::Destroyed => "WindowEvent::Destroyed",
-        WindowEvent::DroppedFile { .. } => "WindowEvent::DroppedFile",
-        WindowEvent::HoveredFile { .. } => "WindowEvent::HoveredFile",
-        WindowEvent::HoveredFileCancelled => "WindowEvent::HoveredFileCancelled",
+        WindowEvent::DragDropped { .. } => "WindowEvent::DragDropped",
+        WindowEvent::DragEntered { .. } => "WindowEvent::DragEntered",
+        WindowEvent::DragLeft { .. } => "WindowEvent::DragLeft",
         WindowEvent::Focused { .. } => "WindowEvent::Focused",
         WindowEvent::KeyboardInput { .. } => "WindowEvent::KeyboardInput",
         WindowEvent::ModifiersChanged { .. } => "WindowEvent::ModifiersChanged",
         WindowEvent::Ime { .. } => "WindowEvent::Ime",
-        WindowEvent::CursorMoved { .. } => "WindowEvent::CursorMoved",
-        WindowEvent::CursorEntered { .. } => "WindowEvent::CursorEntered",
-        WindowEvent::CursorLeft { .. } => "WindowEvent::CursorLeft",
+        WindowEvent::PointerMoved { .. } => "WindowEvent::PointerMoved",
+        WindowEvent::PointerEntered { .. } => "WindowEvent::PointerEntered",
+        WindowEvent::PointerLeft { .. } => "WindowEvent::PointerLeft",
         WindowEvent::MouseWheel { .. } => "WindowEvent::MouseWheel",
-        WindowEvent::MouseInput { .. } => "WindowEvent::MouseInput",
+        WindowEvent::PointerButton { .. } => "WindowEvent::PointerButton",
         WindowEvent::PinchGesture { .. } => "WindowEvent::PinchGesture",
         WindowEvent::RedrawRequested => "WindowEvent::RedrawRequested",
         WindowEvent::DoubleTapGesture { .. } => "WindowEvent::DoubleTapGesture",
         WindowEvent::RotationGesture { .. } => "WindowEvent::RotationGesture",
         WindowEvent::TouchpadPressure { .. } => "WindowEvent::TouchpadPressure",
-        WindowEvent::AxisMotion { .. } => "WindowEvent::AxisMotion",
-        WindowEvent::Touch { .. } => "WindowEvent::Touch",
         WindowEvent::ScaleFactorChanged { .. } => "WindowEvent::ScaleFactorChanged",
         WindowEvent::ThemeChanged { .. } => "WindowEvent::ThemeChanged",
         WindowEvent::Occluded { .. } => "WindowEvent::Occluded",
         WindowEvent::PanGesture { .. } => "WindowEvent::PanGesture",
+        _ => "Event",
     }
 }
