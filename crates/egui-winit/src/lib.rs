@@ -45,7 +45,10 @@ use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
     event::ElementState,
     event_loop::ActiveEventLoop,
-    window::{CursorGrabMode, Window, WindowButtons, WindowLevel},
+    window::{
+        CursorGrabMode, ImeCapabilities, ImeEnableRequest, ImeHint, ImeRequest, ImeRequestData,
+        Window, WindowButtons, WindowLevel,
+    },
 };
 
 pub fn screen_size_in_pixels(window: &dyn Window) -> egui::Vec2 {
@@ -259,12 +262,12 @@ impl State {
         self.clipboard.set_text(text);
     }
 
-    /// Returns [`false`] or the last value that [`Window::set_ime_allowed()`] was called with, used for debouncing.
+    /// Returns whether the integration last requested IME to be enabled, used for debouncing.
     pub fn allow_ime(&self) -> bool {
         self.allow_ime
     }
 
-    /// Set the last value that [`Window::set_ime_allowed()`] was called with.
+    /// Record whether IME was enabled through [`Window::request_ime_update`].
     pub fn set_allow_ime(&mut self, allow: bool) {
         self.allow_ime = allow;
     }
@@ -1405,46 +1408,33 @@ impl State {
                 // `winit::event::Ime::Disabled`.
                 self.pressed_processed_physical_keys.clear();
             }
-
-            profiling::scope!("set_ime_allowed");
-            window.set_ime_allowed(allow_ime);
         }
 
         if let Some(ime) = ime {
-            if !is_toggling_ime && ime.should_interrupt_composition {
-                // TODO(umajho): use a more proper way to interrupt composition
-                // if `winit` provides one in the future.
-
-                window.set_ime_allowed(false);
-                window.set_ime_allowed(true);
-            }
-
-            if ime.purpose != self.old_ime_purpose {
-                self.old_ime_purpose = ime.purpose;
-                window.set_ime_purpose(to_winit_ime_purpose(ime.purpose));
-            }
-
             let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
             let ime_cursor_rect_px = pixels_per_point * ime.cursor_rect;
-            if self.ime_cursor_rect_px != Some(ime_cursor_rect_px)
+            if is_toggling_ime || ime.should_interrupt_composition {
+                if !is_toggling_ime {
+                    // Winit resets composition when switching between input fields.
+                    let _ = window.request_ime_update(ImeRequest::Disable);
+                }
+                let _ =
+                    window.request_ime_update(ime_enable_request(ime.purpose, ime_cursor_rect_px));
+            } else if self.ime_cursor_rect_px != Some(ime_cursor_rect_px)
+                || self.old_ime_purpose != ime.purpose
                 || self.egui_ctx.input(|i| !i.events.is_empty())
             {
-                self.ime_cursor_rect_px = Some(ime_cursor_rect_px);
-                profiling::scope!("set_ime_cursor_area");
-                window.set_ime_cursor_area(
-                    (winit::dpi::PhysicalPosition {
-                        x: ime_cursor_rect_px.min.x,
-                        y: ime_cursor_rect_px.min.y,
-                    })
-                    .into(),
-                    (winit::dpi::PhysicalSize {
-                        width: ime_cursor_rect_px.width(),
-                        height: ime_cursor_rect_px.height(),
-                    })
-                    .into(),
-                );
+                let _ = window.request_ime_update(ImeRequest::Update(ime_request_data(
+                    ime.purpose,
+                    ime_cursor_rect_px,
+                )));
             }
+            self.ime_cursor_rect_px = Some(ime_cursor_rect_px);
+            self.old_ime_purpose = ime.purpose;
         } else {
+            if is_toggling_ime {
+                let _ = window.request_ime_update(ImeRequest::Disable);
+            }
             self.ime_cursor_rect_px = None;
         }
 
@@ -2253,21 +2243,36 @@ fn process_viewport_command(
             window.set_window_icon(winit_icon);
         }
         ViewportCommand::IMERect(rect) => {
-            window.set_ime_cursor_area(
-                (PhysicalPosition::new(
-                    pixels_per_point * rect.min.x,
-                    pixels_per_point * rect.min.y,
-                ))
-                .into(),
-                (PhysicalSize::new(
-                    pixels_per_point * rect.size().x,
-                    pixels_per_point * rect.size().y,
-                ))
-                .into(),
-            );
+            if window
+                .ime_capabilities()
+                .is_some_and(|caps| caps.cursor_area())
+            {
+                let rect = pixels_per_point * rect;
+                let data = ImeRequestData::default().with_cursor_area(
+                    PhysicalPosition::new(rect.min.x, rect.min.y).into(),
+                    PhysicalSize::new(rect.width(), rect.height()).into(),
+                );
+                let _ = window.request_ime_update(ImeRequest::Update(data));
+            }
         }
-        ViewportCommand::IMEAllowed(v) => window.set_ime_allowed(v),
-        ViewportCommand::IMEPurpose(p) => window.set_ime_purpose(to_winit_ime_purpose(p)),
+        ViewportCommand::IMEAllowed(allowed) => {
+            let request = if allowed {
+                ime_enable_request(egui::IMEPurpose::Normal, Rect::ZERO)
+            } else {
+                ImeRequest::Disable
+            };
+            let _ = window.request_ime_update(request);
+        }
+        ViewportCommand::IMEPurpose(purpose) => {
+            if window
+                .ime_capabilities()
+                .is_some_and(|caps| caps.hint_and_purpose())
+            {
+                let data = ImeRequestData::default()
+                    .with_hint_and_purpose(ImeHint::NONE, to_winit_ime_purpose(purpose));
+                let _ = window.request_ime_update(ImeRequest::Update(data));
+            }
+        }
         ViewportCommand::Focus => {
             if !window.has_focus() {
                 window.focus_window();
@@ -2335,6 +2340,25 @@ fn process_viewport_command(
             actions_requested.push(ActionRequested::Paste);
         }
     }
+}
+
+fn ime_request_data(purpose: egui::IMEPurpose, rect_px: Rect) -> ImeRequestData {
+    ImeRequestData::default()
+        .with_hint_and_purpose(ImeHint::NONE, to_winit_ime_purpose(purpose))
+        .with_cursor_area(
+            PhysicalPosition::new(rect_px.min.x, rect_px.min.y).into(),
+            PhysicalSize::new(rect_px.width(), rect_px.height()).into(),
+        )
+}
+
+fn ime_enable_request(purpose: egui::IMEPurpose, rect_px: Rect) -> ImeRequest {
+    let capabilities = ImeCapabilities::new()
+        .with_hint_and_purpose()
+        .with_cursor_area();
+    ImeRequest::Enable(
+        ImeEnableRequest::new(capabilities, ime_request_data(purpose, rect_px))
+            .expect("IME capabilities match the supplied purpose and cursor area"),
+    )
 }
 
 fn to_winit_ime_purpose(purpose: egui::IMEPurpose) -> winit::window::ImePurpose {
